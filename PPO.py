@@ -8,6 +8,7 @@ from tensorflow import keras
 print(keras.__version__)
 
 import gym
+import mujoco_py
 import gym_crumb
 import numpy as np
 import scipy.signal
@@ -58,7 +59,7 @@ class RunningStats:
             self.push(element)
 
 
-class TRPO(object):
+class PPO(object):
     def __init__(self, env):
         ### Environment parameters
         tf.reset_default_graph()
@@ -74,8 +75,6 @@ class TRPO(object):
         self.n_value_epochs = 15
         self.value_batch_size = 512
         self.kl_target = 0.003
-        self.max_kl=0.01
-        self.cg_damping=0.1
         self.beta = 1
         self.beta_max = 20
         self.beta_min = 1 / 20
@@ -108,35 +107,13 @@ class TRPO(object):
 
         self.build_networks()
 
+        ### loss function and optimization
+        self.neg_policy_loss = self.policy_loss_function()
+        self.optimizer = tf.train.AdamOptimizer(learning_rate=self.policy_learning_rate)
+        self.optimize_policy = self.optimizer.minimize(self.neg_policy_loss,
+                                                       var_list=self._policy_model_params.append(self.sigma))
+
         self.sampled_action = tf.squeeze(self.mu + self.sigma * tf.random_normal(shape=tf.shape(self.mu)))
-
-        ##################################
-        ### optimization graph for TRPO
-        ##################################
-        self.neg_policy_loss=self.policy_loss_function()
-        self.flat_grad_surr = self.flat_grad(self.neg_policy_loss, self._policy_model_params)
-        # intermediate grad in conjugate gradient
-        self.cg_inter_vec = tf.placeholder(shape=(None,), dtype=tf.float32)
-        # slice flat_tangent into chunks for each weight
-        self.weight_shapes = map(self.var_shape,self._policy_model_params)
-        self.tangents = self.slice_vector(self.cg_inter_vec, self.weight_shapes)
-
-        # kl divergence where the firsts are fixed
-        Nf = tf.cast(tf.shape(self.input_placeholder)[0], dtype=tf.float32)
-        kl_firstfixed = self.gauss_selfKL_firstfixed(self.mu, self.sigma) / Nf
-
-        # compute fisher transformation matrix
-        self.grads = tf.gradients(kl_firstfixed, self._policy_model_params)
-        self.gradient_vector_product = [tf.reduce_sum(g[0] * t) for (g, t) in zip(self.grads, self.tangents)]
-        self._fisher_vector_product = self.flat_grad(self.gradient_vector_product, self._policy_model_params)
-
-        # network weights -> vector
-        self.flat_weights = tf.concat([tf.reshape(var, [-1]) for var in self._policy_model_params], axis=0)
-
-        # vector -> network weights
-        self.flat_weights_ph = tf.placeholder(shape=(None,), dtype=tf.float32)
-        self.assigns = self.slice_vector(self.flat_weights_ph, self.weight_shapes)
-        self.load_flat_weights = [w.assign(ph) for (w, ph) in zip(self._policy_model_params, self.assigns)]
 
     def build_networks(self):
 
@@ -172,74 +149,10 @@ class TRPO(object):
         self.value_model.summary()
         return self
 
-    def sample_action(self, session, input):
-        return session.run(self.sampled_action,
-                           feed_dict={self.input_placeholder: np.reshape(input, (-1, self.env_state_shape[0]))})
-
-    ###################################
-    ### TRPO update policy
-    ###################################
-    def var_shape(self,x):
-        return [k.value for k in x.get_shape()]
-
-    def numel(self,x):
-        return np.prod(self.var_shape(x))
-
-    def flat_grad(self,loss, var_list):
-        grads = tf.gradients(loss, var_list)
-        return tf.concat([tf.reshape(grad, [self.numel(v)]) for (v, grad) in zip(var_list, grads)], 0)
-
-    def linear_search(self,f, x, fullstep, expected_improve_rate):
-        # in numpy
-        accept_ratio = .1
-        max_backtracks = 10
-        fval = f(x)
-        for (_n_backtracks, stepfrac) in enumerate(.5 ** np.arange(max_backtracks)):
-            xnew = x + stepfrac * fullstep
-            newfval = f(xnew)
-            actual_improve = fval - newfval
-            expected_improve = expected_improve_rate * stepfrac
-            ratio = actual_improve / expected_improve
-            if ratio > accept_ratio and actual_improve > 0:
-                return xnew
-        return x
-
-    # symbolic vector -> symbolic tensor
-    def slice_vector(self,vector, shapes):
-        assert len(vector.get_shape()) == 1
-        start = 0
-        tensors = []
-        for shape in shapes:
-            size = np.prod(shape)
-            tensor = tf.reshape(vector[start:(start + size)], shape)
-            tensors.append(tensor)
-            start += size
-        return tensors
-
-    # conjugate gradient to solve Ax=b
-    from numpy.linalg import inv
-    def conjugate_gradient(self,f_Ax, b, cg_iter=10, residual_tolerance=1e-10):
-        p = b.copy()
-        r = b.copy()
-        x = np.zeros_like(b)
-        rdotr = r.dot(r)
-        for i in range(cg_iter):
-            z = f_Ax(p)
-            v = rdotr / (p.dot(z) + 1e-3)
-            x += v * p
-            r -= v * z
-            newrdotr = r.dot(r)
-            mu = newrdotr / (rdotr + 1e-8)
-            p = r + mu * p
-            rdotr = newrdotr
-            if rdotr < residual_tolerance:
-                break
-        return x
-
     def policy_loss_function(self):
         normal_dist = tf.contrib.distributions.Normal(self.mu, self.sigma)
-        prev_normal_dist = tf.contrib.distributions.Normal(self.previous_mu_placeholder,self.previous_sigma_placeholder)
-
+        prev_normal_dist = tf.contrib.distributions.Normal(self.previous_mu_placeholder,
+                                                           self.previous_sigma_placeholder)
         self.logp = (normal_dist.log_prob(self.action_placeholder))
         self.prev_logp = (prev_normal_dist.log_prob(self.action_placeholder))
 
@@ -251,26 +164,15 @@ class TRPO(object):
         ### adaptive kl penality coefficient
         negloss = -tf.reduce_mean(self.advantages_placeholder * self.ratio)
         negloss += tf.reduce_mean(self.beta_placeholder * self.kl_divergence)
-        negloss += tf.reduce_mean(self.ksi_placeholder * tf.square(tf.maximum(0.0, self.kl_divergence - 2 * self.kl_target)))
+        negloss += tf.reduce_mean(
+            self.ksi_placeholder * tf.square(tf.maximum(0.0, self.kl_divergence - 2 * self.kl_target)))
         return negloss
 
-    def gauss_selfKL_firstfixed(self,mu, logstd):
-        mu1, logstd1 = map(tf.stop_gradient, [mu, logstd])
-        mu2, logstd2 = mu, logstd
-
-        return self.gauss_KL(mu1, logstd1, mu2, logstd2)
-
-    def gauss_KL(self,mu1, logstd1, mu2, logstd2):
-        var1 = tf.exp(2 * logstd1)
-        var2 = tf.exp(2 * logstd2)
-
-        kl = tf.reduce_sum(logstd2 - logstd1 + (var1 + tf.square(mu1 - mu2)) / (2 * var2) - 0.5)
-        return kl
-
+    def sample_action(self, session, input):
+        return session.run(self.sampled_action,
+                           feed_dict={self.input_placeholder: np.reshape(input, (-1, self.env_state_shape[0]))})
 
     def update_policy(self, session, t):
-        self.session=session
-
         states = t['states']
         actions = t['actions']
         advantages = t['advantages']
@@ -285,36 +187,24 @@ class TRPO(object):
         feed_dict[self.previous_mu_placeholder] = np.reshape(prev_mu, (-1, self.env_action_number))
         feed_dict[self.previous_sigma_placeholder] = np.reshape(prev_sigma, (-1, self.env_action_number))
 
-        old_weights = session.run(self.flat_weights)
-        losses=[self.neg_policy_loss, self.kl_divergence, self.entropy]
-
-        def fisher_vector_product(p):
-            feed_dict[self.cg_inter_vec] = p
-            return session.run(self._fisher_vector_product, feed_dict) + self.cg_damping * p
-
-        flat_grad = session.run(self.flat_grad_surr, feed_dict)
-        stepdir = self.conjugate_gradient(fisher_vector_product, -flat_grad)
-        shs = 0.5 * stepdir.dot(fisher_vector_product(stepdir))
-        lm = np.sqrt(shs / self.max_kl)
-        fullstep = stepdir / lm
-
-        def losses_f(flat_weights):
-            feed_dict[self.flat_weights_ph] = flat_weights
-            session.run(self.load_flat_weights, feed_dict)
-            return session.run(losses, feed_dict)
-
-        expected_improve_rate=-flat_grad.dot(stepdir)
-        new_weights = self.linear_search(losses_f, old_weights, fullstep, expected_improve_rate)
-        feed_dict[self.flat_weights_ph] = new_weights
-        session.run(self.load_flat_weights, feed_dict)
-
-        neg_policy_loss, kl_divergence, entropy = session.run(losses,feed_dict=feed_dict)
+        neg_policy_loss, kl_divergence, entropy = 0.0, 0.0, 0.0
+        for _ in range(self.n_policy_epochs):
+            session.run(self.optimize_policy, feed_dict=feed_dict)
+            neg_policy_loss, kl_divergence, entropy = session.run([self.neg_policy_loss, self.kl_divergence, self.entropy], feed_dict=feed_dict)
+            kl_divergence = np.mean(kl_divergence)
+            if kl_divergence > 4 * self.kl_target:
+                break
 
         self.auditor.update({'policy_loss': float("%.5f" % -neg_policy_loss),
                              'kl_divergence': float("%.5f" % kl_divergence),
                              'beta': self.beta,
                              'entropy': float("%.5f" % entropy)})
 
+        if kl_divergence < self.kl_target / 1.5:
+            self.beta /= 2
+        elif kl_divergence > self.kl_target * 1.5:
+            self.beta *= 2
+        self.beta = np.clip(self.beta, self.beta_min, self.beta_max)
 
     def update_value(self, t):
         states = t['states']
@@ -340,7 +230,7 @@ class TRPO(object):
 
             action = self.sample_action(session, state_normalized)
             new_state, reward, terminal, info = self.env.step(action)
-            #self.env.render()
+            self.env.render()
             actions.append(action)
             rewards.append(reward * self.reward_scale)
 
@@ -423,7 +313,7 @@ class TRPO(object):
 
 
 def main():
-    env = gym.make('BipedalWalker-v2')
+    env = gym.make('Reacher-v2')
     trpo = TRPO(env)
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
