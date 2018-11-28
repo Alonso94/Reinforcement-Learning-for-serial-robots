@@ -35,7 +35,7 @@ class CrumbCameraEnv(gym.Env):
         self.aim = self.model_state('box', 'link_box').pose.position
         #self.aim = self.box_state('box', 'link_box').pose.position
         self.unpause()
-        self.action_dim=4
+        self.action_dim=5
         self.obs_dim=(3, 640, 480)
         low = -np.pi/2.0 * np.ones(4)
         high = np.pi/2.0 * np.ones(4)
@@ -64,8 +64,11 @@ class CrumbCameraEnv(gym.Env):
         gripper = self.get_link_pose('gripper_1_link')
         r1 = metric(gripper, self.aim)//0.001*0.001
         _, state = self.get_state()
-        self.arm[action[0]].publish(state[action[0]]+action[1])
-        rospy.sleep(1.5)
+        #self.arm[action[0]].publish(state[action[0]]+action[1])
+        #rospy.sleep(1.5)
+        for i in range(len(action)):
+            self.arm[i].publish(state[i]+action[i]*3.14/16)
+            rospy.sleep(1.5)
         gripper = self.get_link_pose('gripper_1_link')
         vec = self.get_link_pose('wrist_1_link')
         gripper_2_link = self.get_link_pose('gripper_2_link')
@@ -77,7 +80,7 @@ class CrumbCameraEnv(gym.Env):
         _, state = self.get_state()
         jpg_state = self.render('human') 
         jpg_state=self.proc_img(jpg_state)
-        print(jpg_state.shape)
+        #print(jpg_state.shape)
         reward = r1 - r2
         done = False
         if reward < 0:
@@ -87,7 +90,7 @@ class CrumbCameraEnv(gym.Env):
         if (r2//0.025 == 0):
             done = True
             reward = 100 
-        return jpg_state, reward, done
+        return jpg_state, reward, done , {}
 
     def _render(self, mode='human', close=False):
         latest_img = rospy.wait_for_message("crumb_camera/image_raw", Image, timeout=3)
@@ -139,4 +142,5 @@ class CrumbCameraEnv(gym.Env):
 
 
 	
+
 
