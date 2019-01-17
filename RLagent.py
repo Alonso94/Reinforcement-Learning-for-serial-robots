@@ -8,25 +8,32 @@ from tensorflow import keras
 print(keras.__version__)
 
 import gym
+import mujoco_py
 import gym_crumb
 import numpy as np
 import scipy.signal
 from tensorflow.keras.models import Sequential, Model
-from tensorflow.keras.layers import Dense, Input, Conv2D,Dropout,Flatten,MaxPooling2D
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.initializers import RandomNormal
 from tensorflow.keras.regularizers import l2
+from tensorflow.keras.layers import Dense, Input, Conv2D,Dropout,Flatten,MaxPooling2D
+
 
 from utils import *
 
+class RLagent(object):
 
-class TRPO(object):
-    def __init__(self, env):
+    def __init__(self, env,from_images=False,from_images_mujoco=False):
         ### Environment parameters
         tf.reset_default_graph()
         self.env = env
         self.env.reset()
-        self.env_state_shape = self.env.observation_space.shape
+        self.from_images_mujoco=from_images_mujoco
+        if from_images_mujoco:
+            state = self.env.render(mode='rgb_array')
+            self.env_state_shape = state.shape
+        else:
+            self.env_state_shape = self.env.observation_space.shape
         self.env_action_number = self.env.action_space.shape[0]
 
         ### Hyperparameters
@@ -36,16 +43,17 @@ class TRPO(object):
         self.n_value_epochs = 15
         self.value_batch_size = 512
         self.kl_target = 0.003
-        self.max_kl=0.01
-        self.cg_damping=0.1
+        self.cg_damping = 0.1
+        self.max_kl = 0.01
         self.beta = 1
         self.beta_max = 20
         self.beta_min = 1 / 20
         self.ksi = 10
         self.gamma = 0.999
         self.lmbda = 0.975
-        self.horizon = 32
+        self.horizon = 64
         self.activation = 'tanh'
+        self.policy_type = 'MLP'  # or 'RBF'
 
         ### For train
         self.max_episode_count = 1000
@@ -55,7 +63,14 @@ class TRPO(object):
         self.reward_scale = 0.0025
 
         ### Placeholders
-        self.input_placeholder = tf.placeholder(shape=[None,self.env_state_shape[0],self.env_state_shape[1],self.env_state_shape[2]], dtype=tf.float32,name="input")
+        if from_images_mujoco:
+            obs_in_in=[self.env_state_shape[0],self.env_state_shape[1],1]
+        if from_images:
+            obs_in_in=[self.env_state_shape[0],self.env_state_shape[1],self.env_state_shape[2]]
+        else:
+            obs_in_in=[len(self.env.observation_space.high)]
+        self.input_placeholder = tf.placeholder(shape=[None, obs_in_in[:]], dtype=tf.float32,
+                                                name="input")
         self.reward = tf.placeholder(shape=[None, 1], dtype='float32', name='reward')
         self.action_placeholder = tf.placeholder(shape=[None, self.env_action_number], dtype='float32', name='actions')
         self.advantages_placeholder = tf.placeholder(shape=[None,1], dtype='float32', name='GAE_advantage')
@@ -66,21 +81,29 @@ class TRPO(object):
         self.beta_placeholder = tf.placeholder(shape=[], dtype='float32', name='beta_2nd_loss')
         self.ksi_placeholder = tf.placeholder(shape=[], dtype='float32', name='eta_3rd_loss')
 
-        self.build_networks()
+        self.build_networks(from_images or from_images_mujoco)
+
+        ### loss function and optimization
+        self.neg_policy_loss = self.policy_loss_function()
+        self.optimizer = tf.train.AdamOptimizer(learning_rate=self.policy_learning_rate)
+        self.optimize_policy = self.optimizer.minimize(self.neg_policy_loss,
+                                                       var_list=self._policy_model_params.append(self.sigma))
 
         self.sampled_action = tf.squeeze(self.mu + self.sigma * tf.random_normal(shape=tf.shape(self.mu)))
 
-
-    def build_networks(self):
+    def build_networks(self,from_images):
 
         ### Action mean network
         mu_model_input = Input(tensor=self.input_placeholder)
-        h1 = Conv2D(32,kernel_size=(3,3),padding="same",activation="elu")(mu_model_input)
-        pool1=MaxPooling2D(pool_size=(2,2))(h1)
-        h2=Conv2D(64,kernel_size=(3,3),padding="same",activation="elu")(pool1)
-        #pool2=MaxPooling2D(pool_size=(2,2))(h2)
-        features=Flatten()(h2)
-        mu_model = Dense(units=128, activation=self.activation, kernel_initializer=RandomNormal(0, 0.1))(features)
+        if from_images:
+            h1 = Conv2D(32, kernel_size=(3, 3), padding="same", activation="elu")(mu_model_input)
+            pool1 = MaxPooling2D(pool_size=(2, 2))(h1)
+            h2 = Conv2D(64, kernel_size=(3, 3), padding="same", activation="elu")(pool1)
+            features = Flatten()(h2)
+            mu_model = Dense(units=128, activation=self.activation, kernel_initializer=RandomNormal(0, 0.1))(features)
+        else:
+            mu_model = Dense(units=128, activation=self.activation, kernel_initializer=RandomNormal(0, 0.1))(mu_model_input)
+        mu_model = Dense(units=128, activation=self.activation, kernel_initializer=RandomNormal(0, 0.1))(mu_model)
         policy_mean = Dense(units=self.env_action_number, activation=self.activation,
                             kernel_initializer=RandomNormal())(mu_model)
         self.policy_mu_model = Model(inputs=[mu_model_input], outputs=[policy_mean])
@@ -88,13 +111,9 @@ class TRPO(object):
         self._policy_model_params = self.policy_mu_model.trainable_weights
 
         ### State value network
-        value_model_input = Input(batch_shape=(None, self.env_state_shape[0],self.env_state_shape[1],self.env_state_shape[2]))
-        vh1 = Conv2D(32, kernel_size=(3, 3), padding="same", activation="elu")(value_model_input)
-        vpool1 = MaxPooling2D(pool_size=(2, 2))(vh1)
-        vh2 = Conv2D(64, kernel_size=(3, 3), padding="same", activation="elu")(vpool1)
-        #pool2 = MaxPooling2D(pool_size=(2, 2))(h2)
-        features = Flatten()(vh2)
-        value_model = Dense(units=128, activation=self.activation, kernel_regularizer=l2(0.01))(features)
+        value_model_input = Input(batch_shape=(None, self.env_state_shape[0]))
+        value_model = Dense(units=128, activation=self.activation, kernel_regularizer=l2(0.01))(value_model_input)
+        value_model = Dense(units=128, activation=self.activation, kernel_regularizer=l2(0.01))(value_model)
         value = Dense(units=1, activation=None, kernel_initializer=RandomNormal(0, 0.1), kernel_regularizer=l2(0.01))(
             value_model)
         self.value_model = Model(inputs=[value_model_input], outputs=[value])
@@ -113,23 +132,14 @@ class TRPO(object):
         self.value_model.summary()
         return self
 
-    def sample_action(self, session, input):
-        return session.run(self.sampled_action,
-                           feed_dict={self.input_placeholder: np.reshape(input, (-1, self.env_state_shape[0],self.env_state_shape[1],self.env_state_shape[2]))})
-
-    ###################################
-    ### TRPO update policy
-    ###################################
-
     def policy_loss_function(self):
         normal_dist = tf.contrib.distributions.Normal(self.mu, self.sigma)
-        prev_normal_dist = tf.contrib.distributions.Normal(self.previous_mu_placeholder,self.previous_sigma_placeholder)
-
+        prev_normal_dist = tf.contrib.distributions.Normal(self.previous_mu_placeholder,
+                                                           self.previous_sigma_placeholder)
         self.logp = (normal_dist.log_prob(self.action_placeholder))
         self.prev_logp = (prev_normal_dist.log_prob(self.action_placeholder))
 
         self.kl_divergence = tf.contrib.distributions.kl_divergence(normal_dist, prev_normal_dist)
-
         self.entropy = tf.reduce_mean(tf.reduce_sum(normal_dist.entropy(), axis=1))
 
         self.ratio=tf.exp(self.logp - self.prev_logp)
@@ -137,89 +147,16 @@ class TRPO(object):
         ### adaptive kl penality coefficient
         negloss = -tf.reduce_mean(self.advantages_placeholder * self.ratio)
         negloss += tf.reduce_mean(self.beta_placeholder * self.kl_divergence)
-        negloss += tf.reduce_mean(self.ksi_placeholder * tf.square(tf.maximum(0.0, self.kl_divergence - 2 * self.kl_target)))
+        negloss += tf.reduce_mean(
+            self.ksi_placeholder * tf.square(tf.maximum(0.0, self.kl_divergence - 2 * self.kl_target)))
         return negloss
 
-
+    def sample_action(self, session, input):
+        return session.run(self.sampled_action,
+                           feed_dict={self.input_placeholder: np.reshape(input, (-1, self.env_state_shape[0]))})
 
     def update_policy(self, session, t):
-        self.session=session
-
-        states = t['states']
-        actions = t['actions']
-        advantages = t['advantages']
-
-        feed_dict = {self.input_placeholder: states,
-                     self.action_placeholder: actions,
-                     self.advantages_placeholder: advantages,
-                     self.beta_placeholder: self.beta,
-                     self.ksi_placeholder: self.ksi}
-
-        prev_mu, prev_sigma = session.run([self.mu, self.sigma], feed_dict)
-        feed_dict[self.previous_mu_placeholder] = np.reshape(prev_mu, (-1, self.env_action_number))
-        feed_dict[self.previous_sigma_placeholder] = np.reshape(prev_sigma, (-1, self.env_action_number))
-
-        ##################################
-        ### optimization graph for TRPO
-        ##################################
-        neg_policy_loss = self.policy_loss_function()
-        flat_grad_surr = self.flat_grad(neg_policy_loss, self._policy_model_params)
-        # intermediate grad in conjugate gradient
-        cg_inter_vec = tf.placeholder(shape=(None,), dtype=tf.float32)
-        # slice flat_tangent into chunks for each weight
-        weight_shapes = [session.run(var).shape for var in self._policy_model_params]
-        tangents = self.slice_vector(cg_inter_vec, weight_shapes)
-
-        # kl divergence where the firsts are fixed
-        Nf = tf.cast(tf.shape(self.input_placeholder)[0], dtype=tf.float32)
-        kl_firstfixed = self.gauss_selfKL_firstfixed(self.mu, self.sigma) / Nf
-
-        # compute fisher transformation matrix
-        grads = tf.gradients(kl_firstfixed, self._policy_model_params)
-        gradient_vector_product = [tf.reduce_sum(g * t) for (g, t) in zip(grads, tangents)]
-        _fisher_vector_product = self.flat_grad(gradient_vector_product, self._policy_model_params)
-
-        # network weights -> vector
-        flat_weights = tf.concat([tf.reshape(var, [-1]) for var in self._policy_model_params], axis=0)
-
-        # vector -> network weights
-        flat_weights_ph = tf.placeholder(shape=(None,), dtype=tf.float32)
-        assigns = self.slice_vector(flat_weights_ph, weight_shapes)
-        load_flat_weights = [w.assign(ph) for (w, ph) in zip(self._policy_model_params, assigns)]
-
-
-        old_weights = session.run(flat_weights)
-        losses=[neg_policy_loss, self.kl_divergence, self.entropy]
-
-        def fisher_vector_product(p):
-            feed_dict[cg_inter_vec] = p
-            return session.run(_fisher_vector_product, feed_dict) + self.cg_damping * p
-
-        flat_grad = session.run(flat_grad_surr, feed_dict)
-        stepdir = self.conjugate_gradient(fisher_vector_product, -flat_grad)
-        shs = 0.5 * stepdir.dot(fisher_vector_product(stepdir))
-        lm = np.sqrt(shs / self.max_kl)
-        fullstep = stepdir / lm
-
-        def losses_f(flat_weights):
-            feed_dict[flat_weights_ph] = flat_weights
-            session.run(load_flat_weights, feed_dict)
-            return session.run(losses[0], feed_dict)
-
-        expected_improve_rate=-flat_grad.dot(stepdir)
-        new_weights = self.linear_search(losses_f, old_weights, fullstep, expected_improve_rate)
-        feed_dict[flat_weights_ph] = new_weights
-        session.run(load_flat_weights, feed_dict)
-
-        neg_policy_loss, kl_divergence, entropy = session.run(losses,feed_dict=feed_dict)
-        kl_divergence = np.mean(kl_divergence)
-
-
-        self.auditor.update({'policy_loss': float("%.5f" % -neg_policy_loss),
-                             'kl_divergence': float("%.5f" % kl_divergence),
-                             'beta': self.beta,
-                             'entropy': float("%.5f" % entropy)})
-
+        pass
 
     def update_value(self, t):
         states = t['states']
@@ -244,8 +181,12 @@ class TRPO(object):
             norm_states.append(state_normalized)
 
             action = self.sample_action(session, state_normalized)
-            new_state, reward, terminal, info = self.env.step(action)
-            #self.env.render()
+            new_obs, reward, terminal, info = self.env.step(action)
+            if self.from_images_mujoco:
+                new_state = self.env.render(mode='rgb_array')
+            else:
+                new_state=new_obs
+            self.env.render()
             actions.append(action)
             rewards.append(reward * self.reward_scale)
 
@@ -325,16 +266,3 @@ class TRPO(object):
                 print(self.auditor)
 
                 t_processed_prev = t_processed
-
-
-def main():
-    env = gym.make('crumb-camera-v0')
-    trpo = TRPO(env)
-    with tf.Session() as sess:
-        sess.run(tf.global_variables_initializer())
-        sess.run(tf.local_variables_initializer())
-        keras.backend.set_session(sess)
-        trpo.train(sess)
-
-
-main()
